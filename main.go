@@ -17,25 +17,41 @@ import (
 	"strings"
 	"sync"
 	"time"
+	_ "embed" 
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 )
 
+//go:embed prompt.txt
+var systemPrompt string
+
 type AppConfig struct {
-	GitHubSecret      string
-	GitHubToken       string
-	GroqModel		  string
-	GroqKey           string
-	TelegramBotToken  string
-	TelegramUserID    int64
-	Port              string
+	GitHubSecret     string
+	GitHubToken      string
+	GroqModel        string
+	GroqKey          string
+	TelegramBotToken string
+	TelegramUserID   int64
+	Port             string
 }
+
+type PRJob struct {
+	DiffURL string
+	Title   string
+	HTMLURL string
+}
+
+const (
+	MaxWorkers = 5
+	QueueSize  = 100
+)
 
 var (
 	bot       *tgbotapi.BotAPI
 	cfg       AppConfig
 	postState sync.Map
+	jobQueue  chan PRJob 
 )
 
 type PullRequestPayload struct {
@@ -81,6 +97,9 @@ func main() {
 
 	log.Printf("Initialized G2C MVP on @%s", bot.Self.UserName)
 
+	jobQueue = make(chan PRJob, QueueSize)
+	startWorkerPool(MaxWorkers)
+
 	go telegramCallbackListener()
 
 	http.HandleFunc("/webhook", githubWebhookHandler)
@@ -118,7 +137,7 @@ func loadConfig() AppConfig {
 	}
 }
 
-// --- MODULE 1: Webhook Listener ---
+// --- MODULE 1: Webhook Listener & Backpressure ---
 func githubWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -149,7 +168,20 @@ func githubWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if payload.Action == "closed" && payload.PullRequest.Merged {
-		go processPipeline(payload.PullRequest.APIURL, payload.PullRequest.Title, payload.PullRequest.HTMLURL)
+		job := PRJob{
+			DiffURL: payload.PullRequest.APIURL,
+			Title:   payload.PullRequest.Title,
+			HTMLURL: payload.PullRequest.HTMLURL,
+		}
+
+		select {
+		case jobQueue <- job:
+			log.Printf("PR Merge queued for processing: %s", job.Title)
+		default:
+			log.Printf("CRITICAL: Job queue is full! Dropping event for PR: %s", job.Title)
+			http.Error(w, "Service Unavailable: Queue Full", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -163,6 +195,19 @@ func validateGitHubSignature(signature string, payload []byte, secret string) bo
 	mac.Write(payload)
 	expectedMAC := hex.EncodeToString(mac.Sum(nil))
 	return hmac.Equal([]byte(signature[7:]), []byte(expectedMAC))
+}
+
+// --- MODULE 2: Worker Pool (Concurrency Control) ---
+func startWorkerPool(numWorkers int) {
+	for i := 1; i <= numWorkers; i++ {
+		go func(workerID int) {
+			log.Printf("Worker %d started", workerID)
+			for job := range jobQueue {
+				log.Printf("Worker %d processing PR: %s", workerID, job.Title)
+				processPipeline(job.DiffURL, job.Title, job.HTMLURL)
+			}
+		}(i)
+	}
 }
 
 // --- CORE PIPELINE ---
@@ -228,7 +273,7 @@ func generateAndSendPost(diff, title, url string) {
 	payload := GroqRequest{
 		Model: cfg.GroqModel,
 		Messages: []GroqMessage{
-			{Role: "system", Content: fetchSystemPrompt()},
+			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: prompt},
 		},
 	}
@@ -256,14 +301,6 @@ func generateAndSendPost(diff, title, url string) {
 		text := fmt.Sprintf("%s\n\n🔗 [Дивитись PR на GitHub](%s)", result.Choices[0].Message.Content, url)
 		sendToTelegram(text, diff, title, url)
 	}
-}
-
-func fetchSystemPrompt() string {
-	content, err := os.ReadFile("prompt.txt")
-	if err != nil {
-		return "Ти — Senior Tech Writer. Напиши короткий пост про цей git diff."
-	}
-	return string(content)
 }
 
 // --- MODULE: Telegram ---
