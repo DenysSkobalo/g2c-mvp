@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	_ "embed" 
 	"fmt"
 	"io"
 	"log"
@@ -17,14 +18,13 @@ import (
 	"strings"
 	"sync"
 	"time"
-	_ "embed" 
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 )
 
 //go:embed prompt.txt
-var systemPrompt string
+var basePrompt string
 
 type AppConfig struct {
 	GitHubSecret     string
@@ -36,22 +36,18 @@ type AppConfig struct {
 	Port             string
 }
 
-type PRJob struct {
-	DiffURL string
-	Title   string
-	HTMLURL string
+type Job struct {
+	EventType string
+	Title     string
+	URL       string
+	DiffURL   string
 }
-
-const (
-	MaxWorkers = 5
-	QueueSize  = 100
-)
 
 var (
 	bot       *tgbotapi.BotAPI
 	cfg       AppConfig
 	postState sync.Map
-	jobQueue  chan PRJob 
+	jobQueue  = make(chan Job, 100) 
 )
 
 type PullRequestPayload struct {
@@ -62,6 +58,19 @@ type PullRequestPayload struct {
 		Title   string `json:"title"`
 		HTMLURL string `json:"html_url"`
 	} `json:"pull_request"`
+}
+
+type PushPayload struct {
+	Ref        string `json:"ref"`
+	Before     string `json:"before"`
+	After      string `json:"after"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
+	HeadCommit struct {
+		Message string `json:"message"`
+		URL     string `json:"url"`
+	} `json:"head_commit"`
 }
 
 type GroqMessage struct {
@@ -97,10 +106,8 @@ func main() {
 
 	log.Printf("Initialized G2C MVP on @%s", bot.Self.UserName)
 
-	jobQueue = make(chan PRJob, QueueSize)
-	startWorkerPool(MaxWorkers)
-
 	go telegramCallbackListener()
+	initWorkerPool(5) 
 
 	http.HandleFunc("/webhook", githubWebhookHandler)
 
@@ -137,7 +144,7 @@ func loadConfig() AppConfig {
 	}
 }
 
-// --- MODULE 1: Webhook Listener & Backpressure ---
+// --- MODULE 1: Webhook Router & Listener ---
 func githubWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -156,31 +163,34 @@ func githubWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Header.Get("X-GitHub-Event") != "pull_request" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+	eventType := r.Header.Get("X-GitHub-Event")
 
-	var payload PullRequestPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if payload.Action == "closed" && payload.PullRequest.Merged {
-		job := PRJob{
-			DiffURL: payload.PullRequest.APIURL,
-			Title:   payload.PullRequest.Title,
-			HTMLURL: payload.PullRequest.HTMLURL,
+	switch eventType {
+	case "pull_request":
+		var payload PullRequestPayload
+		if err := json.Unmarshal(body, &payload); err == nil {
+			if payload.Action == "closed" && payload.PullRequest.Merged {
+				jobQueue <- Job{
+					EventType: "pull_request",
+					Title:     payload.PullRequest.Title,
+					DiffURL:   payload.PullRequest.APIURL,
+					URL:       payload.PullRequest.HTMLURL,
+				}
+			}
 		}
 
-		select {
-		case jobQueue <- job:
-			log.Printf("PR Merge queued for processing: %s", job.Title)
-		default:
-			log.Printf("CRITICAL: Job queue is full! Dropping event for PR: %s", job.Title)
-			http.Error(w, "Service Unavailable: Queue Full", http.StatusServiceUnavailable)
-			return
+	case "push":
+		var payload PushPayload
+		if err := json.Unmarshal(body, &payload); err == nil {
+			if payload.Before != "0000000000000000000000000000000000000000" {
+				diffURL := fmt.Sprintf("https://api.github.com/repos/%s/compare/%s...%s", payload.Repository.FullName, payload.Before, payload.After)
+				jobQueue <- Job{
+					EventType: "push",
+					Title:     payload.HeadCommit.Message,
+					DiffURL:   diffURL,
+					URL:       payload.HeadCommit.URL,
+				}
+			}
 		}
 	}
 
@@ -197,29 +207,32 @@ func validateGitHubSignature(signature string, payload []byte, secret string) bo
 	return hmac.Equal([]byte(signature[7:]), []byte(expectedMAC))
 }
 
-// --- MODULE 2: Worker Pool (Concurrency Control) ---
-func startWorkerPool(numWorkers int) {
-	for i := 1; i <= numWorkers; i++ {
+// --- MODULE 2: Worker Pool & Pipeline ---
+func initWorkerPool(numWorkers int) {
+	for i := 0; i < numWorkers; i++ {
 		go func(workerID int) {
-			log.Printf("Worker %d started", workerID)
 			for job := range jobQueue {
-				log.Printf("Worker %d processing PR: %s", workerID, job.Title)
-				processPipeline(job.DiffURL, job.Title, job.HTMLURL)
+				processPipeline(job)
 			}
 		}(i)
 	}
 }
 
-// --- CORE PIPELINE ---
-func processPipeline(diffURL, prTitle, prURL string) {
-	rawDiff, err := fetchDiff(diffURL)
+func processPipeline(job Job) {
+	rawDiff, err := fetchDiff(job.DiffURL)
 	if err != nil {
-		log.Printf("Error fetching diff: %v", err)
+		log.Printf("[Error] Fetching diff failed for %s: %v", job.URL, err)
 		return
 	}
 
-	cleanDiff := sanitizeDiff(rawDiff)
-	generateAndSendPost(cleanDiff, prTitle, prURL)
+	cleanDiff, entropy := sanitizeDiff(rawDiff)
+	
+	if entropy < 10 {
+		log.Printf("[Info] Skipped job due to low entropy (Changes: %d). URL: %s", entropy, job.URL)
+		return
+	}
+
+	generateAndSendPost(cleanDiff, job)
 }
 
 func fetchDiff(diffURL string) (string, error) {
@@ -243,11 +256,12 @@ func fetchDiff(diffURL string) (string, error) {
 	return string(body), err
 }
 
-func sanitizeDiff(rawDiff string) string {
+func sanitizeDiff(rawDiff string) (string, int) {
 	var cleaned bytes.Buffer
 	scanner := bufio.NewScanner(strings.NewReader(rawDiff))
 	skip := false
 	ignored := []string{"go.mod", "go.sum", ".json", ".yaml", ".yml", "_test.go", ".md"}
+	entropy := 0
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -262,19 +276,30 @@ func sanitizeDiff(rawDiff string) string {
 		}
 		if !skip {
 			cleaned.WriteString(line + "\n")
+			if (strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++")) ||
+			   (strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---")) {
+				entropy++
+			}
 		}
 	}
-	return cleaned.String()
+	return cleaned.String(), entropy
 }
 
-// --- MODULE: AI Connector ---
-func generateAndSendPost(diff, title, url string) {
-	prompt := fmt.Sprintf("Назва PR: %s\n\nКод (Diff):\n%s", title, diff)
+// --- MODULE 3: AI Connector ---
+func generateAndSendPost(diff string, job Job) {
+	contextMarker := "Це завершений Pull Request. Опиши фінальний результат."
+	if job.EventType == "push" {
+		contextMarker = "Це поточний робочий push розробника (Trunk-Based Development). Сформуй контент як мікро-оновлення в процесі (Build in Public). Фокус на тому, над чим розробник працює прямо зараз."
+	}
+
+	sysPrompt := fmt.Sprintf("%s\n\n[Системний контекст події]: %s", basePrompt, contextMarker)
+	userPrompt := fmt.Sprintf("Назва/Повідомлення: %s\n\nКод (Diff):\n%s", job.Title, diff)
+
 	payload := GroqRequest{
 		Model: cfg.GroqModel,
 		Messages: []GroqMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: prompt},
+			{Role: "system", Content: sysPrompt},
+			{Role: "user", Content: userPrompt},
 		},
 	}
 
@@ -298,13 +323,13 @@ func generateAndSendPost(diff, title, url string) {
 	json.NewDecoder(resp.Body).Decode(&result)
 
 	if len(result.Choices) > 0 {
-		text := fmt.Sprintf("%s\n\n🔗 [Дивитись PR на GitHub](%s)", result.Choices[0].Message.Content, url)
-		sendToTelegram(text, diff, title, url)
+		text := fmt.Sprintf("%s\n\n🔗 [Дивитись зміни на GitHub](%s)", result.Choices[0].Message.Content, job.URL)
+		sendToTelegram(text, diff, job)
 	}
 }
 
-// --- MODULE: Telegram ---
-func sendToTelegram(text, originalDiff, title, url string) {
+// --- MODULE 4: Telegram ---
+func sendToTelegram(text, originalDiff string, job Job) {
 	msg := tgbotapi.NewMessage(cfg.TelegramUserID, text)
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -320,7 +345,8 @@ func sendToTelegram(text, originalDiff, title, url string) {
 		return
 	}
 
-	postState.Store(sentMsg.MessageID, map[string]string{"diff": originalDiff, "title": title, "url": url})
+	jobData, _ := json.Marshal(job)
+	postState.Store(sentMsg.MessageID, map[string]string{"diff": originalDiff, "job": string(jobData)})
 }
 
 func telegramCallbackListener() {
@@ -329,15 +355,19 @@ func telegramCallbackListener() {
 	updates := bot.GetUpdatesChan(u)
 
 	for update := range updates {
-		if update.CallbackQuery == nil { continue }
-		
+		if update.CallbackQuery == nil {
+			continue
+		}
+
 		msgID := update.CallbackQuery.Message.MessageID
-		
+
 		switch update.CallbackQuery.Data {
 		case "regen_post":
 			if val, ok := postState.Load(msgID); ok {
 				d := val.(map[string]string)
-				go generateAndSendPost(d["diff"], d["title"], d["url"])
+				var job Job
+				json.Unmarshal([]byte(d["job"]), &job)
+				go generateAndSendPost(d["diff"], job)
 			}
 		case "done_post":
 			bot.Send(tgbotapi.NewEditMessageReplyMarkup(cfg.TelegramUserID, msgID, tgbotapi.InlineKeyboardMarkup{}))
