@@ -6,9 +6,9 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
-	_ "embed" 
 	"fmt"
 	"io"
 	"log"
@@ -47,7 +47,7 @@ var (
 	bot       *tgbotapi.BotAPI
 	cfg       AppConfig
 	postState sync.Map
-	jobQueue  = make(chan Job, 100) 
+	jobQueue  = make(chan Job, 100)
 )
 
 type PullRequestPayload struct {
@@ -107,7 +107,7 @@ func main() {
 	log.Printf("Initialized G2C MVP on @%s", bot.Self.UserName)
 
 	go telegramCallbackListener()
-	initWorkerPool(5) 
+	initWorkerPool(5)
 
 	http.HandleFunc("/webhook", githubWebhookHandler)
 
@@ -226,7 +226,7 @@ func processPipeline(job Job) {
 	}
 
 	cleanDiff, entropy := sanitizeDiff(rawDiff)
-	
+
 	if entropy < 10 {
 		log.Printf("[Info] Skipped job due to low entropy (Changes: %d). URL: %s", entropy, job.URL)
 		return
@@ -277,7 +277,7 @@ func sanitizeDiff(rawDiff string) (string, int) {
 		if !skip {
 			cleaned.WriteString(line + "\n")
 			if (strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++")) ||
-			   (strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---")) {
+				(strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---")) {
 				entropy++
 			}
 		}
