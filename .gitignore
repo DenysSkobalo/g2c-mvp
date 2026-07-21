@@ -1,4 +1,5 @@
 .env
+.env.example
 
 g2c-mvp
 *.exe
